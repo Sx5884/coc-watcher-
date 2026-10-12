@@ -1111,8 +1111,16 @@ async function loadCwlLeague(tagPath){
 }
 
 function cwlRoundResult(r){
-  if(r.us.stars !== r.opponent.stars) return r.us.stars > r.opponent.stars ? 'win' : 'loss';
-  if(r.us.destruction !== r.opponent.destruction) return r.us.destruction > r.opponent.destruction ? 'win' : 'loss';
+  // Older or incomplete saved CWL records may not contain both sides.
+  const us = r?.us;
+  const opponent = r?.opponent;
+  if(!us || !opponent) return 'tie';
+  const usStars = Number(us.stars ?? 0);
+  const opponentStars = Number(opponent.stars ?? 0);
+  if(usStars !== opponentStars) return usStars > opponentStars ? 'win' : 'loss';
+  const usDestruction = Number(us.destruction ?? 0);
+  const opponentDestruction = Number(opponent.destruction ?? 0);
+  if(usDestruction !== opponentDestruction) return usDestruction > opponentDestruction ? 'win' : 'loss';
   return 'tie';
 }
 
@@ -1749,21 +1757,25 @@ function renderCwl(){
   } else {
     const stateClass = { inWar:'ws-inWar', warEnded:'ws-warEnded', preparation:'ws-preparation' };
     const stateLabel = { inWar:'Battle Day', warEnded:'War Ended', preparation:'Preparation Day' };
-    const rows = cwl.rounds.map(r => {
+    const rows = (Array.isArray(cwl.rounds) ? cwl.rounds : []).filter(r => r?.us && r?.opponent).map(r => {
       const cls = stateClass[r.state] || 'ws-none';
-      const label = stateLabel[r.state] || r.state;
+      const label = stateLabel[r.state] || r.state || 'Unknown';
+      const usStars = Number(r.us.stars ?? 0);
+      const opponentStars = Number(r.opponent.stars ?? 0);
+      const usDestruction = Number(r.us.destruction ?? 0);
+      const opponentDestruction = Number(r.opponent.destruction ?? 0);
       return `
         <div class="war-vs" style="margin-bottom:6px;">
           <div class="war-side">
-            <div class="clan-name">${esc(r.us.name)}</div>
-            <div class="stars">${esc(r.us.stars)}★</div>
-            <div class="destro">${r.us.destruction.toFixed(1)}%</div>
+            <div class="clan-name">${esc(r.us.name || 'Your clan')}</div>
+            <div class="stars">${esc(usStars)}★</div>
+            <div class="destro">${usDestruction.toFixed(1)}%</div>
           </div>
-          <div class="war-mid">Round ${r.round}<br/><span class="war-state ${cls}" style="margin-top:4px;">${esc(label)}</span></div>
+          <div class="war-mid">Round ${esc(r.round ?? '—')}<br/><span class="war-state ${cls}" style="margin-top:4px;">${esc(label)}</span></div>
           <div class="war-side">
-            <div class="clan-name">${esc(r.opponent.name)}</div>
-            <div class="stars">${esc(r.opponent.stars)}★</div>
-            <div class="destro">${r.opponent.destruction.toFixed(1)}%</div>
+            <div class="clan-name">${esc(r.opponent.name || 'Opponent')}</div>
+            <div class="stars">${esc(opponentStars)}★</div>
+            <div class="destro">${opponentDestruction.toFixed(1)}%</div>
           </div>
         </div>`;
     }).join('<hr style="border-color:#262b34;border-style:solid;margin:10px 0;">');
@@ -1773,10 +1785,11 @@ function renderCwl(){
 
   if(history.length > 0){
     const histRows = history.slice().reverse().map(s => {
-      const wins = s.rounds.filter(r => cwlRoundResult(r) === 'win').length;
-      const losses = s.rounds.filter(r => cwlRoundResult(r) === 'loss').length;
-      const ties = s.rounds.filter(r => cwlRoundResult(r) === 'tie').length;
-      return `<tr><td class="name">${esc(s.season)}</td><td>${wins}-${losses}-${ties}</td><td>${s.rounds.length}</td></tr>`;
+      const rounds = Array.isArray(s.rounds) ? s.rounds : [];
+      const wins = rounds.filter(r => cwlRoundResult(r) === 'win').length;
+      const losses = rounds.filter(r => cwlRoundResult(r) === 'loss').length;
+      const ties = rounds.filter(r => cwlRoundResult(r) === 'tie').length;
+      return `<tr><td class="name">${esc(s.season || '—')}</td><td>${wins}-${losses}-${ties}</td><td>${rounds.length}</td></tr>`;
     }).join('');
     html += `
       <h3 style="margin-top:18px;"><span class="dot"></span>Past CWL Seasons</h3>
@@ -2879,27 +2892,54 @@ async function deleteConversationById(id){
   }catch(e){ console.warn('[chat-history] delete error:', e.message); }
 }
 
-// --- Pinning: the chats table has no pinned column, so this is tracked
-// locally per-browser, scoped by clan tag. Pinned chats float to the top.
+// --- Pinning is stored per browser and scoped by clan tag (not synced across devices).
 function pinnedKey(){ return `warroom_pinned_${state.clanTag || 'default'}`; }
 function getPinnedIds(){
-  try{ return JSON.parse(localStorage.getItem(pinnedKey()) || '[]'); }catch(e){ return []; }
+  try{
+    const saved = JSON.parse(localStorage.getItem(pinnedKey()) || '[]');
+    return Array.isArray(saved) ? saved.filter(id => typeof id === 'string') : [];
+  }catch(e){
+    console.warn('[chat-pin] Could not read pinned chats:', e.message);
+    return [];
+  }
 }
-function isPinned(id){ return getPinnedIds().includes(id); }
+function isPinned(id){ return getPinnedIds().includes(String(id)); }
 function setPinned(id, pinned){
-  let ids = getPinnedIds();
-  if(pinned && !ids.includes(id)) ids.push(id);
-  if(!pinned) ids = ids.filter(x => x !== id);
-  try{ localStorage.setItem(pinnedKey(), JSON.stringify(ids)); }catch(e){}
+  const chatId = String(id || '');
+  if(!chatId) return false;
+  const ids = getPinnedIds();
+  const next = pinned
+    ? [...ids.filter(existingId => existingId !== chatId), chatId]
+    : ids.filter(existingId => existingId !== chatId);
+  try{
+    localStorage.setItem(pinnedKey(), JSON.stringify(next));
+    return true;
+  }catch(e){
+    console.warn('[chat-pin] Could not save pinned chats:', e.message);
+    setChatSaveError('Pin changes could not be saved in this browser. Check browser storage settings.');
+    return false;
+  }
 }
 function togglePinned(id){
-  setPinned(id, !isPinned(id));
+  const nextPinned = !isPinned(id);
+  if(!setPinned(id, nextPinned)) return;
   renderChatSidebarList();
 }
 
 function renderChatSidebarList(){
   const list = $('#chatSidebarList');
   if(!list) return;
+  // Bind once to the persistent container so clicks continue working after re-render.
+  if(!list.dataset.pinHandlerBound){
+    list.dataset.pinHandlerBound = 'true';
+    list.addEventListener('click', (e) => {
+      const pinButton = e.target.closest('.ch-pin');
+      if(!pinButton || !list.contains(pinButton)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      togglePinned(pinButton.dataset.id);
+    });
+  }
   if(chatHistoryError){
     list.innerHTML = `<div class="save-error" style="padding:8px;">${esc(chatHistoryError)}</div>`;
     return;
@@ -2908,9 +2948,9 @@ function renderChatSidebarList(){
     list.innerHTML = `<div class="chat-history-empty">No saved chats yet — ask something to start one.</div>`;
     return;
   }
-  const pinnedIds = getPinnedIds();
-  const pinned = state.conversations.filter(c => pinnedIds.includes(c.id));
-  const rest = state.conversations.filter(c => !pinnedIds.includes(c.id));
+  const pinnedIds = new Set(getPinnedIds().map(String));
+  const pinned = state.conversations.filter(c => pinnedIds.has(String(c.id)));
+  const rest = state.conversations.filter(c => !pinnedIds.has(String(c.id)));
 
   const renderItem = (c) => {
     const dateLabel = formatDMY(c.updated_at);
@@ -2922,7 +2962,7 @@ function renderChatSidebarList(){
         <div class="ch-date">${esc(dateLabel)}</div>
       </div>
       <div class="ch-btns">
-        <button class="ch-pin${pinnedNow ? ' pinned' : ''}" data-id="${esc(c.id)}" title="${pinnedNow ? 'Unpin' : 'Pin'} chat">📌</button>
+        <button type="button" class="ch-pin${pinnedNow ? ' pinned' : ''}" data-id="${esc(c.id)}" aria-pressed="${pinnedNow ? 'true' : 'false'}" title="${pinnedNow ? 'Unpin' : 'Pin'} chat" aria-label="${pinnedNow ? 'Unpin' : 'Pin'} chat">📌</button>
         <button class="ch-delete" data-id="${esc(c.id)}" title="Delete chat">×</button>
       </div>
     </div>`;
@@ -2945,9 +2985,6 @@ function renderChatSidebarList(){
   });
   list.querySelectorAll('.ch-delete').forEach(btn => {
     btn.addEventListener('click', (e) => { e.stopPropagation(); deleteConversationById(btn.dataset.id); });
-  });
-  list.querySelectorAll('.ch-pin').forEach(btn => {
-    btn.addEventListener('click', (e) => { e.stopPropagation(); togglePinned(btn.dataset.id); });
   });
 }
 
